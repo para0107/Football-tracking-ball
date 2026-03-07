@@ -62,8 +62,10 @@ from config import (
     KALMAN_Q_VELOCITY,
     KALMAN_R_POSITION,
     KALMAN_P_INITIAL,
+    ENABLE_CAMERA_COMPENSATION,
 )
 from detector import BallDetector, DetectionResult
+from motion_compensator import CameraMotionCompensator
 
 
 # ---------------------------------------------------------------------------
@@ -309,14 +311,15 @@ def draw_trajectory(frame, trail: deque) -> np.ndarray:
     return overlay
 
 
-def draw_hud(frame, frame_idx, fps, detected, source, kf=None) -> np.ndarray:
+def draw_hud(frame, frame_idx, fps, detected, source, kf=None, cmc_active=False) -> np.ndarray:
     """Draw heads-up display with frame stats."""
     overlay = frame.copy()
     h, w    = frame.shape[:2]
 
     lines = [
         f"Frame: {frame_idx}",
-        f"Detected: {'YES' if detected else 'NO'} [{source}]",
+        f"Detected: {"YES" if detected else "NO"} [{source}]",
+        f"CMC: {"ON" if cmc_active else "OFF"}",
     ]
     if kf is not None and kf.initialised:
         vx, vy = kf.velocity
@@ -404,6 +407,13 @@ def run_stage1(video_path: str,
 
     # --- Initialise detector ---
     detector = BallDetector()
+
+    # --- Initialise camera motion compensator ---
+    compensator = CameraMotionCompensator() if ENABLE_CAMERA_COMPENSATION else None
+    if compensator:
+        logger.info("Camera motion compensation: ENABLED (optical flow)")
+    else:
+        logger.info("Camera motion compensation: DISABLED")
 
     # --- Initialise Kalman filter ---
     kf = SimpleKalmanFilter(dt=camera.dt)
@@ -499,6 +509,43 @@ def run_stage1(video_path: str,
                 yolo_frames += 1
             else:
                 hough_frames += 1
+
+        # ----------------------------------------------------------------
+        # Camera motion compensation
+        # Must happen BEFORE Kalman update so the filter tracks
+        # ball motion in world space, not camera-relative pixel space.
+        # ----------------------------------------------------------------
+        if compensator is not None:
+            if total_frames == 1:
+                # Initialise on first frame
+                compensator.initialise(frame)
+            else:
+                if result is not None:
+                    # Compensate raw detection for camera motion
+                    cx_comp, cy_comp = compensator.compensate(
+                        frame,
+                        result.cx,
+                        result.cy,
+                        result.radius_px,
+                    )
+                    # Replace raw position with compensated position
+                    # Note: radius_px is unaffected (pure zoom compensation
+                    # would affect it, but handheld pan/tilt does not)
+                    result = DetectionResult(
+                        cx=cx_comp,
+                        cy=cy_comp,
+                        radius_px=result.radius_px,
+                        confidence=result.confidence,
+                        source=result.source,
+                    )
+
+                # Advance compensator regardless of detection
+                compensator.update(
+                    frame,
+                    ball_cx=result.cx         if result else None,
+                    ball_cy=result.cy         if result else None,
+                    ball_radius_px=result.radius_px if result else None,
+                )
 
         # ----------------------------------------------------------------
         # Kalman filter — with missed frame tracking and reset logic
@@ -690,6 +737,17 @@ def run_stage1(video_path: str,
             "gt_tp": gt_tp, "gt_fp": gt_fp, "gt_fn": gt_fn,
             "precision": precision, "recall": recall, "f1": f1,
         })
+
+    if compensator:
+        cmc_summary = compensator.summary()
+        metrics["cmc_applied"]  = cmc_summary["compensation_applied"]
+        metrics["cmc_failed"]   = cmc_summary["compensation_failed"]
+        metrics["cmc_rate"]     = cmc_summary["success_rate"]
+        logger.info("CMC applied      : %d frames (%.1f%%)",
+                    cmc_summary["compensation_applied"],
+                    cmc_summary["success_rate"] * 100)
+        logger.info("CMC failed       : %d frames",
+                    cmc_summary["compensation_failed"])
 
     # Print summary
     logger.info("=" * 50)

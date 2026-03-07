@@ -73,6 +73,19 @@ HOUGH_MAX_DIST_FROM_KALMAN: float = 150.0   # pixels
 # to help with re-acquisition.
 YOLO_RECOVERY_CONFIDENCE: float = 0.35
 
+
+# ---------------------------------------------------------------------------
+# Camera motion compensation
+# ---------------------------------------------------------------------------
+
+# Enable/disable optical flow camera motion compensation.
+# When True, ball pixel positions are corrected for camera movement
+# before being fed to the Kalman filter.
+# Rationale: pixel trajectory ≠ world trajectory when camera moves.
+# Method: Lucas-Kanade optical flow on background features + RANSAC homography
+# References: Lucas & Kanade 1981; Shi & Tomasi 1994; Hartley & Zisserman Ch.4
+ENABLE_CAMERA_COMPENSATION: bool = True
+
 # ---------------------------------------------------------------------------
 # Kalman validity / reset
 # ---------------------------------------------------------------------------
