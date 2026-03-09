@@ -246,179 +246,111 @@ def save_excel(positions: list, path: str) -> None:
 
 def evaluate_deepsportradar(dataset_path: str,
                             estimator: BallEstimator3D) -> dict:
-    """
-    Evaluate 3D estimator on DeepSportRadar-v1 basketball dataset.
-
-    Dataset provides per-image:
-        item.image          — RGB numpy array
-        item.calib          — full camera calibration (K, R, T)
-        item.ball.center    — GT 3D position as Point3D
-        item.ball.visible   — always True in ball_views.pickle
-
-    Evaluation:
-        1. Run YOLO detector on item.image → radius_px
-        2. Extract fx, ppx, ppy from item.calib.K
-        3. Run estimator → predicted (X, Y, Z)
-        4. Compare against GT item.ball.center
-        5. Compute MAE depth (Z), MAE full 3D
-
-    Error decomposition:
-        - Oracle radius_px: calib.compute_length2D(D_basketball, ball.center)
-          This gives the EXACT radius_px if detection were perfect.
-        - Detector error: |detected_r - oracle_r|
-        - Estimator error: MAE using oracle_r (isolates formula error)
-        - Combined error: MAE using detected_r (real-world performance)
-
-    Reference:
-        Van Zandycke & De Vleeschouwer CVPRW 2022 — our comparison baseline
-        reports MAE on same dataset, same metric.
-
-    Note: Ball diameter = 0.24m (basketball), not 0.22m (football).
-          Adjusted in estimator call via ball_diameter_m parameter.
-    """
-    try:
-        from mlworkflow import PickledDataset
-    except ImportError:
-        logger.error(
-            "mlworkflow not installed. "
-            "Install with: pip install mlworkflow\n"
-            "Also install deepsport toolkit: "
-            "pip install deepsport-toolbox"
-        )
-        return {}
+    import pickle
 
     ball_views_path = os.path.join(dataset_path, "ball_views.pickle")
     if not os.path.exists(ball_views_path):
-        logger.error(
-            "ball_views.pickle not found at %s\n"
-            "Run preparation script first:\n"
-            "  python deepsport/scripts/prepare_ball_views_dataset.py "
-            "--dataset-folder %s",
-            ball_views_path, dataset_path,
-        )
+        logger.error("ball_views.pickle not found at %s", ball_views_path)
         return {}
 
     logger.info("Loading DeepSportRadar dataset from %s ...", dataset_path)
-    ds = PickledDataset(ball_views_path)
+    with open(ball_views_path, "rb") as f:
+        ball_views = pickle.load(f)
+    logger.info("Loaded %d ball views", len(ball_views))
 
-    # Metrics accumulators
-    errors_z_combined  = []   # depth error using detected radius
-    errors_3d_combined = []   # full 3D error using detected radius
-    errors_z_oracle    = []   # depth error using oracle radius
-    errors_3d_oracle   = []   # full 3D error using oracle radius
-    detector_r_errors  = []   # |detected_r - oracle_r|
-    n_total = 0
+    errors_z_combined  = []
+    errors_3d_combined = []
+    errors_z_oracle    = []
+    errors_3d_oracle   = []
+    detector_r_errors  = []
+    n_total    = 0
     n_detected = 0
 
     detector = BallDetector()
 
-    for key in ds.keys:
-        item    = ds.query_item(key)
-        image   = item.image      # numpy RGB
-        calib   = item.calib
-        gt      = item.ball.center
-
+    for view in ball_views:
         n_total += 1
 
-        # Convert RGB to BGR for OpenCV/YOLO
-        bgr = cv2.cvtColor(image, cv2.COLOR_RGB2BGR)
+        image_path  = view["image_path"]
+        gt_center   = view["ball_center"]   # [X, Y, Z] world mm
+        cal         = view.get("calibration")
+        oracle_r    = view.get("radius_px")  # pre-computed in prepare script
+        cx_gt_px    = view.get("cx_px")
+        cy_gt_px    = view.get("cy_px")
 
-        # --- Run YOLO detector ---
+        # GT in metres (ball_center is in mm)
+        gt_X = float(gt_center[0]) / 1000.0
+        gt_Y = float(gt_center[1]) / 1000.0
+        gt_Z = float(gt_center[2]) / 1000.0
+
+        # Extract intrinsics from calibration
+        if cal is None:
+            continue
+        KK  = np.array(cal["KK"], dtype=np.float64).reshape(3, 3)
+        fx  = float(KK[0, 0])
+        fy  = float(KK[1, 1])
+        ppx = float(KK[0, 2])
+        ppy = float(KK[1, 2])
+
+        # Load image and run detector
+        bgr = cv2.imread(str(image_path))
+        if bgr is None:
+            continue
+
         det = detector.detect(bgr)
 
-        # --- Extract intrinsics from calib.K ---
-        # calib.K is the 3x3 intrinsic matrix [[fx,0,ppx],[0,fy,ppy],[0,0,1]]
-        K   = np.array(calib.K).reshape(3, 3)
-        fx  = float(K[0, 0])
-        fy  = float(K[1, 1])
-        ppx = float(K[0, 2])
-        ppy = float(K[1, 2])
-
-        # --- Compute oracle radius_px ---
-        # calib.compute_length2D(real_diameter_m, 3D_center) returns
-        # the expected apparent diameter in pixels given perfect detection.
-        # We use radius = diameter / 2.
-        try:
-            oracle_diameter_px = calib.compute_length2D(
-                BASKETBALL_DIAMETER_M, gt
-            )[0]
-            oracle_r = oracle_diameter_px / 2.0
-        except Exception:
-            oracle_r = None
-
-        # --- GT position ---
-        gt_X = float(gt.x) if hasattr(gt, 'x') else float(gt[0])
-        gt_Y = float(gt.y) if hasattr(gt, 'y') else float(gt[1])
-        gt_Z = float(gt.z) if hasattr(gt, 'z') else float(gt[2])
-
-        # --- Estimator using DETECTED radius ---
         if det is not None:
             n_detected += 1
             detected_r = det.radius_px
             cx, cy     = det.cx, det.cy
 
-            # Use calib intrinsics (not D435i defaults)
             Z_pred = (fx * BASKETBALL_DIAMETER_M) / (2.0 * detected_r)
             X_pred = (cx - ppx) * Z_pred / fx
             Y_pred = (cy - ppy) * Z_pred / fy
 
-            err_z  = abs(Z_pred - gt_Z)
-            err_3d = np.sqrt(
+            errors_z_combined.append(abs(Z_pred - gt_Z))
+            errors_3d_combined.append(float(np.sqrt(
                 (X_pred-gt_X)**2 + (Y_pred-gt_Y)**2 + (Z_pred-gt_Z)**2
-            )
-            errors_z_combined.append(err_z)
-            errors_3d_combined.append(err_3d)
+            )))
 
-            # --- Detector radius error ---
             if oracle_r is not None:
                 detector_r_errors.append(abs(detected_r - oracle_r))
 
-        # --- Estimator using ORACLE radius (isolates formula error) ---
-        if oracle_r is not None and oracle_r > 0 and det is not None:
-            # Use detected centre but oracle radius
-            # This tells us: IF detection were perfect, how good is the formula?
+        # Oracle path: use pre-projected GT centre + oracle radius
+        if oracle_r is not None and oracle_r > 0 and cx_gt_px is not None:
             Z_oracle = (fx * BASKETBALL_DIAMETER_M) / (2.0 * oracle_r)
-            X_oracle = (cx - ppx) * Z_oracle / fx
-            Y_oracle = (cy - ppy) * Z_oracle / fy
+            X_oracle = (cx_gt_px - ppx) * Z_oracle / fx
+            Y_oracle = (cy_gt_px - ppy) * Z_oracle / fy
 
-            err_z_o  = abs(Z_oracle - gt_Z)
-            err_3d_o = np.sqrt(
+            errors_z_oracle.append(abs(Z_oracle - gt_Z))
+            errors_3d_oracle.append(float(np.sqrt(
                 (X_oracle-gt_X)**2 + (Y_oracle-gt_Y)**2 + (Z_oracle-gt_Z)**2
-            )
-            errors_z_oracle.append(err_z_o)
-            errors_3d_oracle.append(err_3d_o)
+            )))
 
-        if n_total % 100 == 0:
-            logger.info(
-                "DeepSportRadar: processed %d items | detected %d",
-                n_total, n_detected,
-            )
+        if n_total % 50 == 0:
+            logger.info("Processed %d/%d | detected %d",
+                        n_total, len(ball_views), n_detected)
 
-    # --- Compute metrics ---
+    # --- Metrics ---
     metrics = {
-        "n_total":          n_total,
-        "n_detected":       n_detected,
-        "detection_rate":   n_detected / n_total if n_total > 0 else 0,
+        "n_total":        n_total,
+        "n_detected":     n_detected,
+        "detection_rate": n_detected / n_total if n_total > 0 else 0,
     }
-
     if errors_z_combined:
         metrics.update({
-            "mae_depth_combined":   float(np.mean(errors_z_combined)),
-            "mae_3d_combined":      float(np.mean(errors_3d_combined)),
-            "std_depth_combined":   float(np.std(errors_z_combined)),
+            "mae_depth_combined": float(np.mean(errors_z_combined)),
+            "mae_3d_combined":    float(np.mean(errors_3d_combined)),
+            "std_depth_combined": float(np.std(errors_z_combined)),
         })
     if errors_z_oracle:
         metrics.update({
-            "mae_depth_oracle":     float(np.mean(errors_z_oracle)),
-            "mae_3d_oracle":        float(np.mean(errors_3d_oracle)),
-            "std_depth_oracle":     float(np.std(errors_z_oracle)),
+            "mae_depth_oracle": float(np.mean(errors_z_oracle)),
+            "mae_3d_oracle":    float(np.mean(errors_3d_oracle)),
+            "std_depth_oracle": float(np.std(errors_z_oracle)),
         })
     if detector_r_errors:
-        metrics.update({
-            "mae_radius_px":        float(np.mean(detector_r_errors)),
-        })
-
-    # --- Error decomposition ---
+        metrics["mae_radius_px"] = float(np.mean(detector_r_errors))
     if "mae_depth_combined" in metrics and "mae_depth_oracle" in metrics:
         metrics["error_from_detector_m"] = (
             metrics["mae_depth_combined"] - metrics["mae_depth_oracle"]
@@ -428,33 +360,26 @@ def evaluate_deepsportradar(dataset_path: str,
     logger.info("=" * 55)
     logger.info("DEEPSPORTRADAR EVALUATION RESULTS")
     logger.info("=" * 55)
-    logger.info("Total images      : %d", metrics.get("n_total", 0))
-    logger.info("Detected          : %d (%.1f%%)",
+    logger.info("Total images       : %d", metrics.get("n_total", 0))
+    logger.info("Detected           : %d (%.1f%%)",
                 metrics.get("n_detected", 0),
                 metrics.get("detection_rate", 0) * 100)
-    logger.info("")
-    logger.info("--- Combined error (detected radius) ---")
-    logger.info("MAE depth (Z)     : %.3f m",
+    logger.info("MAE depth combined : %.3f m",
                 metrics.get("mae_depth_combined", float('nan')))
-    logger.info("MAE full 3D       : %.3f m",
+    logger.info("MAE 3D combined    : %.3f m",
                 metrics.get("mae_3d_combined", float('nan')))
-    logger.info("")
-    logger.info("--- Oracle error (perfect detection) ---")
-    logger.info("MAE depth (Z)     : %.3f m",
+    logger.info("MAE depth oracle   : %.3f m",
                 metrics.get("mae_depth_oracle", float('nan')))
-    logger.info("MAE full 3D       : %.3f m",
+    logger.info("MAE 3D oracle      : %.3f m",
                 metrics.get("mae_3d_oracle", float('nan')))
-    logger.info("")
-    logger.info("--- Error decomposition ---")
-    logger.info("MAE radius_px     : %.2f px",
+    logger.info("MAE radius_px      : %.2f px",
                 metrics.get("mae_radius_px", float('nan')))
     logger.info("Error from detector: %.3f m",
                 metrics.get("error_from_detector_m", float('nan')))
-    logger.info("Error from formula : %.3f m",
-                metrics.get("mae_depth_oracle", float('nan')))
     logger.info("=" * 55)
 
     return metrics
+
 
 
 # ---------------------------------------------------------------------------
