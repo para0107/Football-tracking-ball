@@ -253,7 +253,7 @@ def evaluate_deepsportradar(dataset_path: str,
         logger.error("ball_views.pickle not found at %s", ball_views_path)
         return {}
 
-    logger.info("Loading DeepSportRadar dataset from %s ...", dataset_path)
+    logger.info("Loading football ball views from %s ...", dataset_path)
     with open(ball_views_path, "rb") as f:
         ball_views = pickle.load(f)
     logger.info("Loaded %d ball views", len(ball_views))
@@ -271,28 +271,33 @@ def evaluate_deepsportradar(dataset_path: str,
     for view in ball_views:
         n_total += 1
 
-        image_path  = view["image_path"]
-        gt_center   = view["ball_center"]   # [X, Y, Z] world mm
-        cal         = view.get("calibration")
-        oracle_r    = view.get("radius_px")  # pre-computed in prepare script
-        cx_gt_px    = view.get("cx_px")
-        cy_gt_px    = view.get("cy_px")
+        image_path = view["image_path"]
+        gt_center  = view["ball_center"]   # [X, Y, Z] world mm
+        cal        = view.get("calibration")
+        oracle_r   = view.get("radius_px")
+        cx_gt_px   = view.get("cx_px")
+        cy_gt_px   = view.get("cy_px")
 
-        # GT in metres (ball_center is in mm)
-        gt_X = float(gt_center[0]) / 1000.0
-        gt_Y = float(gt_center[1]) / 1000.0
-        gt_Z = float(gt_center[2]) / 1000.0
-
-        # Extract intrinsics from calibration
         if cal is None:
             continue
+
         KK  = np.array(cal["KK"], dtype=np.float64).reshape(3, 3)
         fx  = float(KK[0, 0])
         fy  = float(KK[1, 1])
         ppx = float(KK[0, 2])
         ppy = float(KK[1, 2])
 
-        # Load image and run detector
+        # Transform GT world position (mm) → camera space depth (m)
+        R        = np.array(cal["R"], dtype=np.float64).reshape(3, 3)
+        T        = np.array(cal["T"], dtype=np.float64).reshape(3, 1)
+        gt_world = np.array([[float(gt_center[0])],
+                              [float(gt_center[1])],
+                              [float(gt_center[2])]])   # mm
+        gt_cam   = R @ gt_world + T                      # mm, camera space
+        gt_Z_cam = float(gt_cam[2, 0]) / 1000.0          # m
+        gt_X_cam = float(gt_cam[0, 0]) / 1000.0
+        gt_Y_cam = float(gt_cam[1, 0]) / 1000.0
+
         bgr = cv2.imread(str(image_path))
         if bgr is None:
             continue
@@ -304,27 +309,31 @@ def evaluate_deepsportradar(dataset_path: str,
             detected_r = det.radius_px
             cx, cy     = det.cx, det.cy
 
-            Z_pred = (fx * BASKETBALL_DIAMETER_M) / (2.0 * detected_r)
+            Z_pred = (fx * BALL_DIAMETER_M) / (2.0 * detected_r)
             X_pred = (cx - ppx) * Z_pred / fx
             Y_pred = (cy - ppy) * Z_pred / fy
 
-            errors_z_combined.append(abs(Z_pred - gt_Z))
+            errors_z_combined.append(abs(Z_pred - gt_Z_cam))
             errors_3d_combined.append(float(np.sqrt(
-                (X_pred-gt_X)**2 + (Y_pred-gt_Y)**2 + (Z_pred-gt_Z)**2
+                (X_pred - gt_X_cam)**2 +
+                (Y_pred - gt_Y_cam)**2 +
+                (Z_pred - gt_Z_cam)**2
             )))
 
             if oracle_r is not None:
                 detector_r_errors.append(abs(detected_r - oracle_r))
 
-        # Oracle path: use pre-projected GT centre + oracle radius
+        # Oracle: GT projected centre + GT radius
         if oracle_r is not None and oracle_r > 0 and cx_gt_px is not None:
-            Z_oracle = (fx * BASKETBALL_DIAMETER_M) / (2.0 * oracle_r)
+            Z_oracle = (fx * BALL_DIAMETER_M) / (2.0 * oracle_r)
             X_oracle = (cx_gt_px - ppx) * Z_oracle / fx
             Y_oracle = (cy_gt_px - ppy) * Z_oracle / fy
 
-            errors_z_oracle.append(abs(Z_oracle - gt_Z))
+            errors_z_oracle.append(abs(Z_oracle - gt_Z_cam))
             errors_3d_oracle.append(float(np.sqrt(
-                (X_oracle-gt_X)**2 + (Y_oracle-gt_Y)**2 + (Z_oracle-gt_Z)**2
+                (X_oracle - gt_X_cam)**2 +
+                (Y_oracle - gt_Y_cam)**2 +
+                (Z_oracle - gt_Z_cam)**2
             )))
 
         if n_total % 50 == 0:
@@ -358,8 +367,9 @@ def evaluate_deepsportradar(dataset_path: str,
 
     # --- Print summary ---
     logger.info("=" * 55)
-    logger.info("DEEPSPORTRADAR EVALUATION RESULTS")
+    logger.info("FOOTBALL BALL EVALUATION RESULTS")
     logger.info("=" * 55)
+    logger.info("Ball diameter used : %.3f m (football)", BALL_DIAMETER_M)
     logger.info("Total images       : %d", metrics.get("n_total", 0))
     logger.info("Detected           : %d (%.1f%%)",
                 metrics.get("n_detected", 0),
