@@ -68,8 +68,37 @@ class TrajectoryVisualizer:
         self._times:    deque = deque(maxlen=max_length)
         self._parabola: Optional[np.ndarray] = None   # [a, b, c] coefficients
 
-    def update(self, cx: float, cy: float, time_s: float) -> None:
-        """Add a new position to the trail."""
+    def update(self, cx: float, cy: float,
+               time_s: float, source: str = 'yolo') -> None:
+        """
+        Add a new position to the trail.
+
+        Only YOLO and Hough detections are added to the trajectory trail.
+        Kalman-only predictions (source='kalman') during miss streaks are
+        excluded — they use stale radius_px and produce physically incorrect
+        constant-depth positions that would corrupt the trail with a
+        horizontal line at the frame edge.
+
+        Additionally, only add points when the ball is visibly moving —
+        suppress points where pixel displacement from last position is very
+        small (stationary ball phase creates a dense noisy cluster that
+        overwhelms the actual trajectory).
+        """
+        # Only include real detections in the trail
+        if source not in ('yolo', 'hough'):
+            return
+
+        # Suppress near-stationary points (< MIN_MOVEMENT pixels from last)
+        # This cleans up the stationary phase cluster
+        MIN_MOVEMENT_PX = 3.0
+        if self._trail:
+            last_cx, last_cy = self._trail[-1]
+            dist = ((cx - last_cx)**2 + (cy - last_cy)**2) ** 0.5
+            if dist < MIN_MOVEMENT_PX:
+                # Still update time but don't add to trail
+                # (keeps parabola fit time-anchored)
+                return
+
         self._trail.append((float(cx), float(cy)))
         self._times.append(float(time_s))
 
@@ -238,24 +267,33 @@ class TopViewMap:
         """
         Args:
             canvas_w/h:     Canvas size in pixels
-            world_range_m:  World extent mapped to canvas (metres)
-                            e.g. 12.0 means ±6m lateral, 0–12m depth
+            world_range_m:  Initial world extent. Auto-scales as
+                            positions are added to always fit all data.
         """
         self._canvas_w     = canvas_w
         self._canvas_h     = canvas_h
         self._world_range  = world_range_m
-        self._scale        = canvas_h / world_range_m   # px per metre
+        self._scale        = canvas_h / world_range_m
         self._positions:   List[Tuple[float, float, float]] = []
-                           # list of (X, Z, time_s)
+
+        # Auto-scale bounds — updated as positions arrive
+        self._x_min = -1.0
+        self._x_max =  1.0
+        self._z_min =  0.0
+        self._z_max =  world_range_m
 
         # Camera is at bottom-centre of canvas
         self._cam_canvas_x = canvas_w // 2
-        self._cam_canvas_y = canvas_h - 30   # near bottom
+        self._cam_canvas_y = canvas_h - 30
 
     def update(self, pos: Position3D) -> None:
-        """Add a valid 3D position to the map history."""
-        if pos.valid:
+        """
+        Add a valid 3D position to the map history.
+        Excludes kalman-only predictions to avoid flat constant-depth lines.
+        """
+        if pos.valid and pos.source in ('yolo', 'hough'):
             self._positions.append((pos.X, pos.Z, pos.time_s))
+            self._update_scale()
 
     def render(self) -> np.ndarray:
         """
@@ -309,42 +347,74 @@ class TopViewMap:
     # Internal
     # ------------------------------------------------------------------
 
+    def _update_scale(self) -> None:
+        """
+        Recompute canvas scale so all data points fit with 10% padding.
+        Called whenever a new position is added.
+        """
+        if not self._positions:
+            return
+
+        xs = [p[0] for p in self._positions]
+        zs = [p[1] for p in self._positions]
+
+        x_pad = max(0.5, (max(xs) - min(xs)) * 0.1 + 0.5)
+        z_pad = max(0.5, (max(zs) - min(zs)) * 0.1 + 0.5)
+
+        self._x_min = min(xs) - x_pad
+        self._x_max = max(xs) + x_pad
+        self._z_min = max(0, min(zs) - z_pad)
+        self._z_max = max(zs) + z_pad
+
     def _world_to_canvas(self, X: float, Z: float) -> Tuple[int, int]:
         """
-        Convert world (X, Z) coordinates to canvas pixel coordinates.
-
-        X=0 maps to canvas centre horizontally.
-        Z=0 (camera position) maps to near bottom of canvas.
-        Z increases upward on canvas (depth = away from viewer).
+        Convert world (X, Z) to canvas pixels using auto-scaled bounds.
+        X maps horizontally (left=negative, right=positive).
+        Z maps vertically (small Z=bottom, large Z=top).
         """
-        cx = self._cam_canvas_x + int(X * self._scale)
-        cy = self._cam_canvas_y - int(Z * self._scale)
+        x_range = max(self._x_max - self._x_min, 0.1)
+        z_range = max(self._z_max - self._z_min, 0.1)
+
+        # Margins
+        margin_x = 40
+        margin_y = 50
+        plot_w   = self._canvas_w - 2 * margin_x
+        plot_h   = self._canvas_h - 2 * margin_y
+
+        cx = margin_x + int((X - self._x_min) / x_range * plot_w)
+        # Z increases upward on canvas (depth away = toward top)
+        cy = self._canvas_h - margin_y - int((Z - self._z_min) / z_range * plot_h)
         return cx, cy
 
     def _draw_grid(self, canvas: np.ndarray,
                    label_depth: bool = False) -> None:
-        """Draw metric grid lines every 2 metres."""
-        for z in range(0, int(self._world_range) + 1, 2):
+        """Draw metric grid lines spaced 1 metre apart within data bounds."""
+        z_start = int(self._z_min)
+        z_end   = int(self._z_max) + 2
+
+        for z in range(z_start, z_end, 1):
             _, cy = self._world_to_canvas(0, z)
             if 0 <= cy < self._canvas_h:
                 cv2.line(canvas, (0, cy), (self._canvas_w, cy),
                          (50, 50, 50), 1)
                 cv2.putText(canvas, f"{z}m", (5, cy - 3),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.35,
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.32,
                             (100, 100, 100), 1)
 
-        for x in range(-int(self._world_range//2),
-                       int(self._world_range//2) + 1, 2):
-            cx, _ = self._world_to_canvas(x, 0)
+        x_start = int(self._x_min) - 1
+        x_end   = int(self._x_max) + 2
+        for x in range(x_start, x_end, 1):
+            cx, _ = self._world_to_canvas(x, self._z_min)
             if 0 <= cx < self._canvas_w:
                 cv2.line(canvas, (cx, 0), (cx, self._canvas_h),
                          (50, 50, 50), 1)
 
     def _draw_camera(self, canvas: np.ndarray) -> None:
-        """Draw camera as a triangle at its canvas position."""
-        cx, cy = self._cam_canvas_x, self._cam_canvas_y
-        pts = np.array([
-            [cx, cy - 15],
+        """Draw camera as a triangle at Z=0, X=0 in world coords."""
+        cx, cy = self._world_to_canvas(0.0, self._z_min * 0.5)
+        cy     = min(cy, self._canvas_h - 20)
+        pts    = np.array([
+            [cx,      cy - 15],
             [cx - 10, cy + 5],
             [cx + 10, cy + 5],
         ], dtype=np.int32)
@@ -440,7 +510,7 @@ def run_stage3_4(video_path:      str,
 
         # Update visualisers with valid positions
         if pos is not None and pos.valid:
-            traj_vis.update(pos.cx_px, pos.cy_px, pos.time_s)
+            traj_vis.update(pos.cx_px, pos.cy_px, pos.time_s, pos.source)
             top_map.update(pos)
 
         # --- Stage 3: trajectory overlay ---
