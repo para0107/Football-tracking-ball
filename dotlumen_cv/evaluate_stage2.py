@@ -549,8 +549,9 @@ def run_stage2(video_path:   str,
             else:
                 consecutive_misses += 1
                 if consecutive_misses >= KALMAN_MAX_MISSED_FRAMES:
-                    kf.x[2, 0] = 0.0
                     kf.x[3, 0] = 0.0
+                    kf.x[4, 0] = 0.0
+                    kf.x[5, 0] = 0.0
                 kf.x[0, 0] = float(np.clip(kf.x[0, 0], 0, camera.frame_width))
                 kf.x[1, 0] = float(np.clip(kf.x[1, 0], 0, camera.frame_height))
 
@@ -567,7 +568,7 @@ def run_stage2(video_path:   str,
                 time_s=time_s,
                 cx_px=kf_cx,
                 cy_px=kf_cy,
-                radius_px=result.radius_px,
+                radius_px=kf.radius,   # smoothed via 6D Kalman state
                 source=result.source,
             )
         elif kf.initialised and consecutive_misses < KALMAN_MAX_MISSED_FRAMES:
