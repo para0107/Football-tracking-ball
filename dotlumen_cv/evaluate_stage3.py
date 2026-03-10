@@ -177,12 +177,12 @@ def run_full_pipeline(video_path: str,
 
         # --- Kalman ---
         if result is not None and not kf.initialised:
-            kf.initialise(result.cx, result.cy)
+            kf.initialise(result.cx, result.cy, result.radius_px)
 
         if kf.initialised:
             kf.predict()
             if result is not None:
-                kf.update([result.cx, result.cy])
+                kf.update([result.cx, result.cy, result.radius_px])
                 consecutive_misses = 0
             else:
                 consecutive_misses += 1

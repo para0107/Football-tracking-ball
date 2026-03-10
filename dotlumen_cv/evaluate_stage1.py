@@ -75,12 +75,23 @@ from motion_compensator import CameraMotionCompensator
 
 class SimpleKalmanFilter:
     """
-    Linear Kalman Filter for 2D ball tracking.
-    State vector: [cx, cy, vx, vy]
+    Linear Kalman Filter for 2D ball tracking + radius smoothing.
 
-    This is a self-contained implementation using only numpy,
-    so the stage 1 script runs without filterpy installed.
-    The full tracker.py will use filterpy for cleaner code.
+    State vector: [cx, cy, r, vx, vy, vr]
+        cx, cy   — ball centre in pixels
+        r        — ball radius in pixels (CRITICAL: feeds depth formula)
+        vx, vy   — pixel velocity (px/s)
+        vr       — radius rate of change (px/s, negative = approaching)
+
+    WHY INCLUDE radius IN STATE:
+        Z = (fx * D_real) / (2 * radius_px)
+        A 0.4px std in radius_px → ±0.2m jitter in depth Z at 7m distance.
+        Kalman smoothing of radius reduces this jitter significantly
+        without slowing the tracker's response to real ball approach.
+
+        Measured from rgb.avi stationary phase:
+          raw radius std:    0.405 px → ±0.203m depth jitter
+          smoothed radius:   expected std < 0.1px → <0.05m jitter
 
     References:
         Kalman R.E. (1960) — original paper
@@ -90,65 +101,77 @@ class SimpleKalmanFilter:
 
     def __init__(self, dt: float):
         self.dt = dt
-        n = 4   # state dimension
-        m = 2   # measurement dimension (cx, cy only)
+        n = 6   # state: [cx, cy, r, vx, vy, vr]
+        m = 3   # measurement: [cx, cy, r]
 
-        # State transition matrix — constant velocity model
-        # x(t+1) = Φ · x(t) + process_noise
+        # State transition: constant velocity model for all 3 quantities
+        # cx(t+1) = cx(t) + vx*dt
+        # cy(t+1) = cy(t) + vy*dt
+        # r(t+1)  = r(t)  + vr*dt
         self.F = np.array([
-            [1, 0, dt,  0],
-            [0, 1,  0, dt],
-            [0, 0,  1,  0],
-            [0, 0,  0,  1],
+            [1, 0, 0, dt,  0,  0],
+            [0, 1, 0,  0, dt,  0],
+            [0, 0, 1,  0,  0, dt],
+            [0, 0, 0,  1,  0,  0],
+            [0, 0, 0,  0,  1,  0],
+            [0, 0, 0,  0,  0,  1],
         ], dtype=float)
 
-        # Measurement matrix — we observe position only, not velocity
-        # YOLO gives (cx, cy); velocity is inferred
+        # Measurement matrix: we observe cx, cy, r directly
         self.H = np.array([
-            [1, 0, 0, 0],
-            [0, 1, 0, 0],
+            [1, 0, 0, 0, 0, 0],
+            [0, 1, 0, 0, 0, 0],
+            [0, 0, 1, 0, 0, 0],
         ], dtype=float)
 
-        # Process noise covariance Q
-        # Velocity diagonal is higher to allow for sudden kicks
-        # (Mitigation for nonlinearity — see discussion in docs)
+        # Process noise Q
+        # Position/radius: small — we trust the physics model
+        # Velocity: larger — allows sudden changes (kick, approach)
+        # vr: moderate — radius changes gradually during approach
         self.Q = np.diag([
-            KALMAN_Q_POSITION,
-            KALMAN_Q_POSITION,
-            KALMAN_Q_VELOCITY,
-            KALMAN_Q_VELOCITY,
+            KALMAN_Q_POSITION,   # cx
+            KALMAN_Q_POSITION,   # cy
+            0.5,                 # r  — small: radius changes smoothly
+            KALMAN_Q_VELOCITY,   # vx
+            KALMAN_Q_VELOCITY,   # vy
+            2.0,                 # vr — moderate: approach speed varies
         ])
 
-        # Measurement noise covariance R
-        # Reflects YOLO localisation uncertainty
-        # Tune based on DeepSportRadar oracle evaluation (post-implementation)
-        self.R = np.diag([KALMAN_R_POSITION, KALMAN_R_POSITION])
+        # Measurement noise R
+        # r measurement noise reflects YOLO localisation uncertainty
+        # R_r = 2.0 means: trust smoothed radius over raw detection
+        # (raw std ≈ 0.4px, so R_r slightly above that)
+        self.R = np.diag([
+            KALMAN_R_POSITION,   # cx
+            KALMAN_R_POSITION,   # cy
+            2.0,                 # r — YOLO radius noise (pixels²)
+        ])
 
-        # State estimate and covariance — uninitialised
-        self.x = None           # [cx, cy, vx, vy]
-        self.P = None           # 4x4 covariance matrix
+        # State and covariance
+        self.x = None
+        self.P = None
         self.initialised = False
-
-        # Store prior (after predict, before update) for visualisation
         self.x_prior = None
         self.P_prior = None
 
-    def initialise(self, cx: float, cy: float) -> None:
+    def initialise(self, cx: float, cy: float,
+                   radius: float = 15.0) -> None:
         """Initialise state from first detection."""
-        self.x = np.array([[cx], [cy], [0.0], [0.0]], dtype=float)
-        self.P = np.eye(4) * KALMAN_P_INITIAL
+        self.x = np.array(
+            [[cx], [cy], [radius], [0.0], [0.0], [0.0]],
+            dtype=float
+        )
+        self.P = np.eye(6) * KALMAN_P_INITIAL
         self.initialised = True
         logger.info(
-            "Kalman filter initialised at (%.1f, %.1f)", cx, cy
+            "Kalman filter initialised at (%.1f, %.1f) r=%.1f",
+            cx, cy, radius,
         )
 
     def predict(self) -> np.ndarray:
         """
-        Predict step — project state forward using physics model.
-        Uncertainty GROWS here (P increases).
-
-        Corresponds to Kalman (1960) Eq. (24):
-          P*(t+1) = Φ* · P*(t) · Φ*ᵀ + Q(t)
+        Predict step — uncertainty grows.
+        P*(t+1) = F·P*(t)·Fᵀ + Q
         """
         self.x_prior = self.F @ self.x
         self.P_prior = self.F @ self.P @ self.F.T + self.Q
@@ -158,34 +181,43 @@ class SimpleKalmanFilter:
 
     def update(self, measurement: np.ndarray) -> np.ndarray:
         """
-        Update step — correct prediction with new measurement.
-        Uncertainty SHRINKS here (P decreases).
+        Update step — uncertainty shrinks.
+        measurement: [cx, cy, radius_px]
 
-        Kalman Gain K determines the blend ratio:
-          K = P · Hᵀ · (H · P · Hᵀ + R)⁻¹
-
-        Innovation = measurement - H · x_predicted
-        If innovation is large → kick detected → filter adapts
-
-        Corresponds to Kalman (1960) Eq. (25) — ∆*(t)
+        Joseph form: P = (I-KH)P(I-KH)ᵀ + KRKᵀ
+        Guarantees positive-definiteness numerically.
         """
-        z = np.array(measurement, dtype=float).reshape(2, 1)
+        z = np.array(measurement, dtype=float).reshape(3, 1)
 
-        # Innovation (residual)
         innovation = z - self.H @ self.x
+        S          = self.H @ self.P @ self.H.T + self.R
+        K          = self.P @ self.H.T @ np.linalg.inv(S)
 
-        # Innovation covariance
-        S = self.H @ self.P @ self.H.T + self.R
-
-        # Kalman gain
-        K = self.P @ self.H.T @ np.linalg.inv(S)
-
-        # State update
         self.x = self.x + K @ innovation
 
-        # Covariance update (Joseph form for numerical stability)
-        I_KH = np.eye(4) - K @ self.H
+        I_KH  = np.eye(6) - K @ self.H
         self.P = I_KH @ self.P @ I_KH.T + K @ self.R @ K.T
+
+        return self.x.copy()
+
+    def update_position_only(self, cx: float, cy: float) -> np.ndarray:
+        """
+        Update with position only (no radius measurement).
+        Used when radius is unreliable (e.g. partial occlusion).
+        Keeps radius smoothing active via prediction only.
+        """
+        H2 = self.H[:2, :]   # 2x6 — only position rows
+        R2 = self.R[:2, :2]  # 2x2
+        z  = np.array([[cx], [cy]], dtype=float)
+
+        innovation = z - H2 @ self.x
+        S          = H2 @ self.P @ H2.T + R2
+        K          = self.P @ H2.T @ np.linalg.inv(S)
+
+        self.x = self.x + K @ innovation
+
+        I_KH  = np.eye(6) - K @ H2
+        self.P = I_KH @ self.P @ I_KH.T + K @ R2 @ K.T
 
         return self.x.copy()
 
@@ -195,14 +227,24 @@ class SimpleKalmanFilter:
         return (float(self.x[0, 0]), float(self.x[1, 0]))
 
     @property
+    def radius(self) -> float:
+        """Current smoothed radius estimate in pixels."""
+        return max(1.0, float(self.x[2, 0]))
+
+    @property
     def velocity(self) -> tuple:
-        """Current estimated velocity (vx, vy) in pixels/frame."""
-        return (float(self.x[2, 0]), float(self.x[3, 0]))
+        """Current estimated velocity (vx, vy) in px/s."""
+        return (float(self.x[3, 0]), float(self.x[4, 0]))
 
     @property
     def position_uncertainty(self) -> float:
         """Standard deviation of position estimate (pixels)."""
         return float(np.sqrt((self.P[0, 0] + self.P[1, 1]) / 2.0))
+
+    @property
+    def radius_uncertainty(self) -> float:
+        """Standard deviation of radius estimate (pixels)."""
+        return float(np.sqrt(abs(self.P[2, 2])))
 
 
 # ---------------------------------------------------------------------------
@@ -551,14 +593,14 @@ def run_stage1(video_path: str,
         # Kalman filter — with missed frame tracking and reset logic
         # ----------------------------------------------------------------
         if result is not None and not kf.initialised:
-            kf.initialise(result.cx, result.cy)
+            kf.initialise(result.cx, result.cy, result.radius_px)
 
         if kf.initialised:
             kf.predict()
 
             if result is not None:
                 # Good detection — update and reset miss counter
-                kf.update([result.cx, result.cy])
+                kf.update([result.cx, result.cy, result.radius_px])
                 consecutive_misses = 0
             else:
                 # No detection this frame — predict only
@@ -583,8 +625,9 @@ def run_stage1(video_path: str,
                             kf.x[0, 0], kf.x[1, 0],
                         )
                     # Zero velocity — hold last position
-                    kf.x[2, 0] = 0.0
                     kf.x[3, 0] = 0.0
+                    kf.x[4, 0] = 0.0
+                    kf.x[5, 0] = 0.0
 
                 # --- Out-of-bounds check ---
                 # If Kalman drifted outside the frame despite the above,
